@@ -1,0 +1,9 @@
+*.o
+test
+test-kc*
+test-ldb*
+test-lmdb*
+log
+*.dSYM
+*.a
+*.so
