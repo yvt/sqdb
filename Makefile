@@ -9,11 +9,14 @@ CXXFLAGS += -DNDEBUG -O3 -g
 # -DSQDB_DEBUGLOG
 
 default:		all
-all:			test
+all:			test libsqdb.a sqdbutil
 # libsqdb.a
 
 test:			libsqdb.a test.cpp Makefile
 				$(CXX) -o test test.cpp -L. -lsqdb $(CXXFLAGS) -lsnappy
+
+sqdbutil:		libsqdb.a sqdbutil.cpp Makefile
+				$(CXX) -o sqdbutil sqdbutil.cpp -L. -lsqdb $(CXXFLAGS) -lsnappy -lboost_filesystem -lboost_system
 
 libsqdb.a:		sqdb.o
 				ar cru libsqdb.a sqdb.o
