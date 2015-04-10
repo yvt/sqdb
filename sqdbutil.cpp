@@ -6,6 +6,7 @@
 #include <vector>
 #include <boost/filesystem.hpp>
 #include <exception>
+#include <boost/optional.hpp>
 
 using namespace std;
 using namespace boost::filesystem;
@@ -18,7 +19,7 @@ static constexpr int ExitStatusNotFound = 66;	// EX_NOINPUT
 
 static void printUsage()
 {
-	cerr << "USAGE: sqdbutil FILENAME (new FILENAME -p PAGESIZE -l LEAFSIZE|get ID|put ID [-|FILENAME]|rm ID)" << endl;
+	cerr << "USAGE: sqdbutil FILENAME (new FILENAME -p PAGESIZE -l LEAFSIZE|get ID|put ID [-|FILENAME]|rm ID|find ID)" << endl;
 }
 
 int main(int argc, char **argv)
@@ -69,6 +70,26 @@ int main(int argc, char **argv)
 			unique_ptr<sqdb::Database> db(sqdb::Database::openDatabase(argv[1]));
 			
 			db->put(id, string());
+
+			return ExitStatusSuccess;
+		}
+
+		if (!strcmp(argv[2], "find")) {
+			if (!exists(argv[1])) {
+				cerr << "database file '" << argv[1] << "' doesn't exist." << endl;
+				return ExitStatusIOError;
+			}
+
+			boost::optional<uint64_t> id = stoull(argv[3]);
+
+			unique_ptr<sqdb::Database> db(sqdb::Database::openDatabase(argv[1]));
+
+			id = db->find(*id);
+			
+			while (id) {
+				cout << *id << endl;
+				id = db->find(*id + 1);
+			}	
 
 			return ExitStatusSuccess;
 		}

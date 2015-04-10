@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cstdint>
+#include <boost/optional.hpp>
 
 namespace sqdb
 {
@@ -29,6 +30,7 @@ namespace sqdb
 
 		virtual ValueType get(KeyType key) = 0;
 		virtual void put(KeyType key, const ValueType &value) = 0;
+		virtual boost::optional<KeyType> find(KeyType start = 0) = 0;
 
 		virtual void sync(bool hard) = 0;
 	};

@@ -173,6 +173,7 @@ namespace sqdb
 
 	using OptionalIndex32 = OptionalIndex<uint32_t, static_cast<uint32_t>(-1)>;
 	using OptionalIndex64 = OptionalIndex<uint64_t, static_cast<uint64_t>(-1)>;
+	using OptionalSizeType = OptionalIndex<size_t, static_cast<size_t>(-1)>;
 
 	class ByteBuffer
 	{
@@ -481,6 +482,7 @@ namespace sqdb
 
 			ValueType get(KeyType key) override;
 			void put(KeyType key, const ValueType &value) override;
+			boost::optional<KeyType> find(KeyType start = 0) override;
 
 			mmr::LockedData<HeaderData> header();
 		private:
@@ -1237,6 +1239,14 @@ namespace sqdb
 				{
 					std::fill(data(), data() + t.numNodeItems(), OptionalIndex64(boost::none));
 				}
+				OptionalSizeType find(TrieTable &t, size_t start)
+				{
+					auto it = find_if(data() + start, data() + t.numNodeItems(), [](const OptionalIndex64 &o){ return o; });
+					if (it == data() + t.numNodeItems())
+						return boost::none;
+					else
+						return it - data();
+				}
 			private:
 				array<OptionalIndex64, 65536> data_; // dummy
 			};
@@ -1278,6 +1288,7 @@ namespace sqdb
 				OptionalIndex64 firstPageIndex() const { return firstPageIndex_; }
 				inline string get(size_t);
 				inline void put(size_t, const string&);
+				inline OptionalSizeType find(size_t);
 			};
 			struct ActiveLeaf
 			{
@@ -1343,10 +1354,10 @@ namespace sqdb
 				mask(t.numNodeItems() - 1) { }
 				inline uint32_t operator()()
 				{
+					assert(shift >= 0);
 					uint32_t ret = key >> shift;
 					ret &= mask;
 					shift -= diff;
-					assert(shift >= 0);
 					return ret;
 				}
 			};
@@ -1358,6 +1369,7 @@ namespace sqdb
 
 			inline std::string get(uint64_t key);
 			inline void put(uint64_t key, const std::string &value);
+			inline boost::optional<uint64_t> find(uint64_t start);
 
 			void sync(); // sync LeafReadWriter 
 		};
@@ -1441,6 +1453,10 @@ namespace sqdb
 		void DatabaseImpl::put(KeyType key, const ValueType &value)
 		{
 			table_->put(key, value);
+		}
+		auto DatabaseImpl::find(KeyType start) -> boost::optional<KeyType>
+		{
+			return table_->find(start);
 		}
 
 		mmr::LockedData<HeaderData> DatabaseImpl::header()
@@ -1707,6 +1723,16 @@ namespace sqdb
 			entries_[i].newData = s;
 			dirty_ = true;
 		}
+		inline OptionalSizeType TrieTable::LeafReadWriter::find(size_t start)
+		{
+			while (start < entries_.size()) {
+				if (entries_[start].newData ? entries_[start].newData->size() != 0 : entries_[start].sourceLen != 0) {
+					return start;
+				}
+				++start;
+			}
+			return boost::none;
+		}
 
 		inline uint32_t TrieTable::computeNodeItemIndexForKey(uint64_t key, uint32_t level) const
 		{
@@ -1718,7 +1744,8 @@ namespace sqdb
 			return key & (numLeafItems() - 1);
 		}
 
-		__attribute__((always_inline)) // always inline (this function is only used in one place)
+		// Chaotic function
+		__attribute__((always_inline))
 		inline bool TrieTable::selectNodeChild(uint32_t level, uint32_t index, bool create, bool &changed)
 		{
 			auto &activeNode = activeNodes_[level];
@@ -1757,6 +1784,7 @@ namespace sqdb
 						activeNodes_[level + 1].data->makeEmpty(*this);
 					} else {
 						activeNodes_[level + 1].select(*this, activeNode.data->data()[index]);
+						activeNodes_[level + 1].selectedIndex = boost::none;
 						SQLog("  Selected Level %d Node %d.", level + 1, *activeNode.data->data()[index]);
 					}
 				}
@@ -1800,6 +1828,96 @@ namespace sqdb
 		{
 			auto index = *selectKey(key, true);
 			leafRW_.put(index, value);
+		}
+		inline boost::optional<uint64_t> TrieTable::find(uint64_t start)
+		{
+			SQLog("TrieTable::find: Search starts at %d.", start);
+
+			// Leaf-level exact match?
+			auto index = selectKey(start, false);
+			start &= ~(numLeafItems() - 1);
+			if (index) {
+				SQLog("TrieTable::find:   Leaf found for %d.", start);
+
+				// scan the leaf
+				auto ret = leafRW_.find(*index);
+				if (ret) {
+					SQLog("TrieTable::find:   Item found for %d.", start);
+					return start | *ret;
+				} else {
+					SQLog("TrieTable::find:   Item not found for %d.", start);
+				}
+			} else {
+				SQLog("TrieTable::find:   Leaf not found for %d.", start);
+			}
+
+			// Check other nodes (DFS)
+			uint32_t level = 0;
+			while (level + 1 < numLevels_ && 
+				activeNodes_[level].selectedIndex && activeNodes_[level].data->data()[*activeNodes_[level].selectedIndex]) {
+				++level;
+			}
+
+			SQLog("TrieTable::find:   Starting at level %d.", level);
+
+			while (true) {
+				{
+					// Enter.
+					auto &activeNode = activeNodes_[level];
+					size_t inNodeStart = 0;
+					if (!activeNode.selectedIndex) {
+						inNodeStart = 0;
+					} else {
+						inNodeStart = *activeNode.selectedIndex + 1;
+					}
+					auto nextSel = activeNode.data->find(*this, inNodeStart);
+
+					SQLog("TrieTable::find:   [%d] finding child from %d...", level, inNodeStart);
+					if (nextSel)
+						SQLog("TrieTable::find:     --> found at %d...", *nextSel);
+					else
+						SQLog("TrieTable::find:     --> not found...");
+
+					if (nextSel) {
+						bool changed = true;
+						bool selectResult = selectNodeChild(level, *nextSel, false, changed);
+						(void) selectResult; assert(selectResult);
+						(void) changed;
+
+						int shiftAmt = numLeafItemsBits_ + numNodeItemsBits_ * (numLevels_ - 1 - level);
+						// note: (x>>a>>b) isn't (x>>(a+b)) when a + b >= sizeof(x)*CHAR_BITS
+						start = (start >> shiftAmt >> numNodeItemsBits_) << shiftAmt << numNodeItemsBits_;
+						start |= static_cast<uint64_t>(*nextSel) << (numLeafItemsBits_ + numNodeItemsBits_ * (numLevels_ - 1 - level));
+
+						if (level + 1 == numLevels_) {
+							// Entered into leaf.
+							auto ret = leafRW_.find(0);
+							if (ret) {
+								SQLog("TrieTable::find:     Checking leaf and found item at %d.", *ret);
+								return start | *ret;
+							} else {
+								SQLog("TrieTable::find:     Checking leaf and could not find a item.");
+							}
+						} else {
+							// Entered into node.
+							++level;
+						}
+					} else {
+						goto Leave;
+					}
+				}
+				continue;
+
+			Leave:
+				{
+					// Leave.
+					SQLog("TrieTable::find:   Leaving.");
+					if (level == 0){
+						return boost::none;
+					}
+					--level;
+				}
+			}
 		}
 
 	}
